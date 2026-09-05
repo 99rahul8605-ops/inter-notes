@@ -11,22 +11,26 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 cd "$(dirname "$SCRIPT_PATH")"
 
-SESSION_NAME="internotesbot"
+SESSION_NAME="notesbot"
 
 # ---------- 0) Background me (screen session) relaunch karo ----------
-# internotesbot_FOREGROUND already set matlab hum khud screen session ke andar
+# NOTESBOT_FOREGROUND already set matlab hum khud screen session ke andar
 # hain — ab seedha aage badho (setup + run loop).
-if [ -z "${internotesbot_FOREGROUND:-}" ]; then
+if [ -z "${NOTESBOT_FOREGROUND:-}" ]; then
     if command -v screen >/dev/null 2>&1; then
         if screen -list 2>/dev/null | grep -q "\.${SESSION_NAME}[[:space:]]"; then
-            echo "✅ Bot pehle se '$SESSION_NAME' screen session me chal raha hai."
-            echo "   Dekhne ke liye:  screen -r $SESSION_NAME"
-            exit 0
+            echo "🔁 Purana '$SESSION_NAME' session mila — usko band karke fresh restart kar raha hoon..."
+            screen -S "$SESSION_NAME" -X quit 2>/dev/null || true
+            # thoda wait taaki purani process ka lock (notes_bot.lock, .session file) properly release ho jaye
+            for _ in 1 2 3 4 5 6; do
+                sleep 0.5
+                screen -list 2>/dev/null | grep -q "\.${SESSION_NAME}[[:space:]]" || break
+            done
         fi
         echo "🖥️  '$SESSION_NAME' screen session me bot background me start kar raha hoon..."
-        LOG_FILE="$(dirname "$SCRIPT_PATH")/internotesbot_screen.log"
+        LOG_FILE="$(dirname "$SCRIPT_PATH")/notesbot_screen.log"
         rm -f "$LOG_FILE"
-        internotesbot_FOREGROUND=1 screen -L -Logfile "$LOG_FILE" -dmS "$SESSION_NAME" bash "$SCRIPT_PATH"
+        NOTESBOT_FOREGROUND=1 screen -L -Logfile "$LOG_FILE" -dmS "$SESSION_NAME" bash "$SCRIPT_PATH"
 
         # Verify karo ki session actually zinda rahi (turant crash to nahi hui)
         ALIVE=0
@@ -90,7 +94,31 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-# ---------- 2) Dependencies install/update ----------
+# ---------- 2) Python virtual environment ----------
+# venv try karo, lekin agar fail ho (jaise minimal Docker images me
+# 'python3-venv' missing hota hai — activate file bhi nahi banti kabhi
+# kabhi bina hard-error diye), to seedha SYSTEM python use karo. Root
+# Docker container me venv zaroori bhi nahi hai (already isolated hai).
+USE_VENV=0
+if [ ! -d "venv" ]; then
+    if python3 -m venv venv 2>/tmp/venv_err.log && [ -f "venv/bin/activate" ]; then
+        USE_VENV=1
+    else
+        echo "⚠️ venv nahi ban paya (shayad 'python3-venv' package missing hai) — "
+        echo "   system Python seedha use kar raha hoon."
+        rm -rf venv
+    fi
+    rm -f /tmp/venv_err.log
+elif [ -f "venv/bin/activate" ]; then
+    USE_VENV=1
+fi
+
+if [ "$USE_VENV" -eq 1 ]; then
+    # shellcheck disable=SC1091
+    source venv/bin/activate
+fi
+
+# ---------- 3) Dependencies install/update ----------
 _pip_install() {
     # Pehle normal install try karo. Kuch systems (newer Debian/Ubuntu,
     # PEP 668 "externally-managed-environment") isse block kar dete hain —
