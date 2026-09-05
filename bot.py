@@ -494,23 +494,25 @@ def display_title(r) -> str:
     return (r["title"] or "")[:60]
 
 
-def _page_buttons(query: str, results, offset: int):
-    """Ek page ke result buttons + Prev/Next pager."""
+def _page_buttons(query: str, results, offset: int, owner_id: int):
+    """Ek page ke result buttons + Prev/Next pager.
+    owner_id = jisne /find chalaya tha — sirf wahi in buttons ko use kar
+    payega (group me doosre log click karke try karein to warning milegi)."""
     total = len(results)
     npages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = offset // PAGE_SIZE + 1
     chunk = results[offset:offset + PAGE_SIZE]
     buttons = [
         [Button.inline(f"📄 {display_title(res.row)}",
-                       f"note:{res.row['channel_id']}:{res.row['msg_id']}")]
+                       f"note:{res.row['channel_id']}:{res.row['msg_id']}:{owner_id}")]
         for res in chunk
     ]
     if npages > 1:
         pager = []
         if page > 1:
-            pager.append(Button.inline("◀ Prev", f"pg:{offset - PAGE_SIZE}"))
+            pager.append(Button.inline("◀ Prev", f"pg:{offset - PAGE_SIZE}:{owner_id}"))
         if page < npages:
-            pager.append(Button.inline("Next ▶", f"pg:{offset + PAGE_SIZE}"))
+            pager.append(Button.inline("Next ▶", f"pg:{offset + PAGE_SIZE}:{owner_id}"))
         buttons.append(pager)
     text = (f"🔎 \"{query}\" — {total} results (Page {page}/{npages})\n"
             f"Tap the note you want:")
@@ -679,7 +681,7 @@ async def send_result(chat, res: Result):
     await bot.send_message(chat, f"📄 {r['title']}\n{r['text'][:500]}", link_preview=False)
 
 
-async def reply_search(chat, query: str):
+async def reply_search(chat, query: str, owner_id: int):
     results = search(query, limit=50)
     if not results:
         total = db.execute("SELECT COUNT(*) c FROM notes").fetchone()["c"]
@@ -710,12 +712,30 @@ async def reply_search(chat, query: str):
             )
         return
     # Direct file spam nahi — pehle list dikhao (paginated), user tap kare
-    text, buttons = _page_buttons(query, results, 0)
+    text, buttons = _page_buttons(query, results, 0, owner_id)
     await bot.send_message(chat, text, buttons=buttons, link_preview=False)
 
 
-@bot.on(events.CallbackQuery(pattern=r"^pg:(\d+)$"))
+async def _deny_if_not_owner(event, owner_id: int) -> bool:
+    """True return kare to caller turant return kar de. Sirf jisne search
+    kiya tha (ya admin) hi buttons use kar sakta hai — group me doosre
+    users click karke try karein to warning milti hai."""
+    if event.sender_id == owner_id or is_admin(event):
+        return False
+    await event.answer(
+        "⛔ Ye sirf usi ke liye hai jisne search ki thi.\n"
+        "Khud dhoondhne ke liye apna `/find <query>` bhejo.",
+        alert=True,
+    )
+    return True
+
+
+@bot.on(events.CallbackQuery(pattern=r"^pg:(\d+):(-?\d+)$"))
 async def on_page(event):
+    offset = int(event.pattern_match.group(1))
+    owner_id = int(event.pattern_match.group(2))
+    if await _deny_if_not_owner(event, owner_id):
+        return
     if not _check_rate_limit(event.sender_id):
         await event.answer(
             f"⏳ Thoda slow down, {RATE_LIMIT_WINDOW}s me max "
@@ -723,7 +743,6 @@ async def on_page(event):
             alert=True,
         )
         return
-    offset = int(event.pattern_match.group(1))
     msg = await event.get_message()
     query = _query_from_message_text(msg.text if msg else None)
     if query is None:
@@ -740,13 +759,18 @@ async def on_page(event):
             alert=True,
         )
         return
-    text, buttons = _page_buttons(query, results, offset)
+    text, buttons = _page_buttons(query, results, offset, owner_id)
     await event.edit(text, buttons=buttons, link_preview=False)
     await event.answer()
 
 
-@bot.on(events.CallbackQuery(pattern=r"^note:(-?\d+):(\d+)$"))
+@bot.on(events.CallbackQuery(pattern=r"^note:(-?\d+):(\d+):(-?\d+)$"))
 async def on_note_pick(event):
+    cid = int(event.pattern_match.group(1))
+    mid = int(event.pattern_match.group(2))
+    owner_id = int(event.pattern_match.group(3))
+    if await _deny_if_not_owner(event, owner_id):
+        return
     if not _check_file_rate_limit(event.sender_id):
         await event.answer(
             f"⏳ Thoda slow down, {FILE_RATE_LIMIT_WINDOW}s me max "
@@ -754,8 +778,6 @@ async def on_note_pick(event):
             alert=True,
         )
         return
-    cid = int(event.pattern_match.group(1))
-    mid = int(event.pattern_match.group(2))
     r = db.execute(
         "SELECT * FROM notes WHERE channel_id=? AND msg_id=?", (cid, mid)
     ).fetchone()
@@ -839,7 +861,7 @@ async def on_find(event):
     query = event.pattern_match.group(2).strip()
     await _track_user(event, "search")
     async with bot.action(event.chat_id, "typing"):
-        await reply_search(event.chat_id, query)
+        await reply_search(event.chat_id, query, event.sender_id)
 
 
 @bot.on(events.NewMessage(
@@ -857,7 +879,7 @@ async def on_dm_plain_text(event):
     query = event.raw_text.strip()
     await _track_user(event, "search")
     async with bot.action(event.chat_id, "typing"):
-        await reply_search(event.chat_id, query)
+        await reply_search(event.chat_id, query, event.sender_id)
 
 
 @bot.on(events.NewMessage(pattern=r"^/stats(@\w+)?"))
