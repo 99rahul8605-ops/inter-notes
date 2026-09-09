@@ -43,6 +43,7 @@ import struct
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events, utils
@@ -108,12 +109,15 @@ ADMIN_IDS = {
 MONGO_URI = os.environ.get("MONGO_URI", "")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "notes_bot")
 mongo_users = None
+mongo_daily = None  # per-day distinct-user check-ins, /stats ke DAU/WAU trend ke liye
 if MONGO_URI:
     if AsyncIOMotorClient is None:
         print("⚠️ MONGO_URI set hai lekin 'motor' package install nahi hai. "
               "`pip install motor` karo. Filhaal SQLite fallback use ho raha hai.")
     else:
-        mongo_users = AsyncIOMotorClient(MONGO_URI)[MONGO_DB_NAME]["users"]
+        _mongo_db = AsyncIOMotorClient(MONGO_URI)[MONGO_DB_NAME]
+        mongo_users = _mongo_db["users"]
+        mongo_daily = _mongo_db["daily_activity"]
 
 
 def is_admin(event) -> bool:
@@ -126,13 +130,14 @@ async def _deny_if_not_admin(event) -> bool:
         return False
     if not ADMIN_IDS:
         await event.respond(
-            "⛔ Ye admin-only command hai, lekin `.env` me `ADMIN_IDS` set "
-            "nahi hai — isliye abhi koi bhi is command ko use nahi kar sakta.\n"
-            "Apni Telegram user ID @userinfobot se pata karo, phir `.env` me "
-            "`ADMIN_IDS=<tumhari_id>` daal kar bot restart karo."
+            "⛔ **Access Denied**\n"
+            "Ye admin-only command hai, lekin `.env` me `ADMIN_IDS` set "
+            "nahi hai — isliye filhaal koi bhi ise use nahi kar sakta.\n\n"
+            "Apni Telegram user ID @userinfobot se pata karke `.env` me "
+            "`ADMIN_IDS=<apni_id>` add karein, phir bot restart karein."
         )
     else:
-        await event.respond("⛔ Ye admin-only command hai.")
+        await event.respond("⛔ **Access Denied** — ye command sirf admins ke liye hai.")
     return True
 
 
@@ -174,6 +179,24 @@ def _check_file_rate_limit(user_id: int) -> bool:
     return _check_limit(_file_rate_buckets, user_id, FILE_RATE_LIMIT_COUNT, FILE_RATE_LIMIT_WINDOW)
 
 
+async def _record_daily_activity(uid: int, now: int):
+    """DAU/WAU trend ke liye: ek user ek din me sirf EK baar count ho
+    (chahe wo us din search bhi kare aur file bhi maange). SQLite path me
+    commit yahan nahi hota — _track_user ke end me ek saath ho jaata hai."""
+    day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    if mongo_daily is not None:
+        await mongo_daily.update_one(
+            {"_id": f"{uid}:{day}"},
+            {"$setOnInsert": {"user_id": uid, "day": day}},
+            upsert=True,
+        )
+    else:
+        db.execute(
+            "INSERT OR IGNORE INTO daily_activity (user_id, day) VALUES (?,?)",
+            (uid, day),
+        )
+
+
 async def _track_user(event, kind: str):
     """Har allowed search/file-request pe user ki activity record karo
     (/stats me dikhane ke liye). kind = 'search' ya 'file'.
@@ -190,6 +213,7 @@ async def _track_user(event, kind: str):
         pass
     col = "search_count" if kind == "search" else "file_count"
     other_col = "file_count" if kind == "search" else "search_count"
+    await _record_daily_activity(uid, now)
 
     if mongo_users is not None:
         set_fields = {"last_seen": now}
@@ -233,8 +257,8 @@ async def _rate_limit_notice(respond_fn, user_id: int):
     _rate_last_warned[user_id] = now
     try:
         await respond_fn(
-            f"⏳ Thoda slow down! {RATE_LIMIT_WINDOW} second me max "
-            f"{RATE_LIMIT_COUNT} searches allowed hain. Thodi der baad try karo."
+            f"⏳ **Rate limit reached** — {RATE_LIMIT_WINDOW} second me max "
+            f"{RATE_LIMIT_COUNT} searches allowed hain. Thodi der baad dobara try karein."
         )
     except Exception:
         pass
@@ -355,6 +379,31 @@ db.execute(
     )
     """
 )
+# Har user ka har-din ek check-in (/stats me Daily/Weekly Active Users
+# trend dikhane ke liye) — MongoDB backend me isi ka equivalent
+# "daily_activity" collection hai (upar dekho).
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS daily_activity (
+        user_id INTEGER,
+        day     TEXT,
+        PRIMARY KEY (user_id, day)
+    )
+    """
+)
+db.execute("CREATE INDEX IF NOT EXISTS idx_daily_activity_day ON daily_activity(day)")
+# Admin-adjustable runtime config (/settings se change hota hai) — .env
+# ki values sirf DEFAULT/startup value hain, yahan se override persist
+# hoti hai (bot restart ke baad bhi apni value yaad rehti hai).
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at INTEGER
+    )
+    """
+)
 # Purani DB migration: content_hash column + unique index (dedupe ke liye)
 _cols = [r[1] for r in db.execute("PRAGMA table_info(notes)")]
 if "content_hash" not in _cols:
@@ -415,6 +464,282 @@ except sqlite3.IntegrityError:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_hash ON notes(content_hash)"
     )
     db.commit()
+
+
+# ---------------------------------------------------------------- settings catalog
+# In env-vars ko `/settings` se bot ke through hi change kar sakte hain
+# (bina .env edit kiye, bina restart kiye). Sirf "safe" tunable knobs yahan
+# hain — API_ID/API_HASH/BOT_TOKEN/SESSION_STRING/MONGO_URI/CHANNEL jaanbujh
+# kar shamil nahi hain, kyunki inhe badalne ke liye reconnect/restart chahiye
+# ya ye sensitive credentials hain jo chat me nahi bhejni chahiye.
+SETTING_DEFS = {
+    "RATE_LIMIT_COUNT": {
+        "label": "Search rate limit — count", "type": int, "min": 1, "max": 100,
+        "hint": "Ek user X second me max kitni searches kar sakta hai",
+    },
+    "RATE_LIMIT_WINDOW": {
+        "label": "Search rate limit — window (sec)", "type": int, "min": 1, "max": 3600,
+        "hint": "Upar wali limit kitne second ke window me apply hoti hai",
+    },
+    "FILE_RATE_LIMIT_COUNT": {
+        "label": "File rate limit — count", "type": int, "min": 1, "max": 100,
+        "hint": "Ek user X second me max kitni files maang sakta hai",
+    },
+    "FILE_RATE_LIMIT_WINDOW": {
+        "label": "File rate limit — window (sec)", "type": int, "min": 1, "max": 3600,
+        "hint": "Upar wali limit kitne second ke window me apply hoti hai",
+    },
+    "MAX_RESULTS": {
+        "label": "Inline results limit", "type": int, "min": 1, "max": 50,
+        "hint": "Inline mode (@botname query) me max kitne results dikhein",
+    },
+    "PAGE_SIZE": {
+        "label": "Results per page", "type": int, "min": 1, "max": 20,
+        "hint": "/find ke paginated list me ek page pe kitne notes dikhein",
+    },
+    "GROUP_ID": {
+        "label": "Search-allowed group ID", "type": "optional_str",
+        "hint": "Khali chhodo to bot sab groups me search karega. Set karne "
+                "ke liye numeric group ID (jaise -100123456789) bhejo.",
+    },
+}
+
+
+def _setting_display_value(key: str):
+    return globals().get(key)
+
+
+def _format_setting_value(key: str, value) -> str:
+    if key == "GROUP_ID":
+        return value if value else "*(khali — sab groups)*"
+    return str(value)
+
+
+def _load_persisted_settings():
+    """Startup pe DB me persisted overrides (agar hain) .env defaults ke
+    upar apply karo, taaki `/settings`/`/addadmin`/`/deladmin` se ki gayi
+    changes restart ke baad bhi yaad rahein."""
+    for row in db.execute("SELECT key, value FROM settings"):
+        key, raw = row["key"], row["value"]
+        if key == "ADMIN_IDS":
+            try:
+                globals()["ADMIN_IDS"] = {int(x) for x in raw.split(",") if x.strip()}
+            except ValueError:
+                pass
+            continue
+        spec = SETTING_DEFS.get(key)
+        if not spec:
+            continue  # purani/anjaan key, ignore
+        try:
+            globals()[key] = int(raw) if spec["type"] is int else raw
+        except (TypeError, ValueError):
+            continue
+
+
+def _save_admin_ids():
+    """ADMIN_IDS set ko settings table me persist karo (comma-separated)."""
+    db.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        ("ADMIN_IDS", ",".join(str(x) for x in sorted(ADMIN_IDS)), int(time.time())),
+    )
+    db.commit()
+
+
+def _apply_setting(key: str, raw_value: str):
+    """Naya value validate karke apply + persist karo.
+    Returns (ok: bool, message: str)."""
+    spec = SETTING_DEFS.get(key)
+    if not spec:
+        return False, f"❌ Unknown setting: `{key}`"
+
+    raw_value = raw_value.strip()
+    if spec["type"] is int:
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return False, f"❌ `{key}` ke liye number chahiye (jaise `10`)."
+        if not (spec["min"] <= value <= spec["max"]):
+            return False, (
+                f"❌ `{key}` sirf {spec['min']} se {spec['max']} ke beech "
+                f"ho sakta hai."
+            )
+    elif spec["type"] == "optional_str":
+        value = "" if raw_value in ("-", "off", "none", "khali") else raw_value
+        if value:
+            try:
+                int(value)  # GROUP_ID numeric hona chahiye
+            except ValueError:
+                return False, "❌ Group ID numeric hona chahiye (jaise `-100123456789`)."
+    else:
+        value = raw_value
+
+    globals()[key] = value
+    db.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, str(value), int(time.time())),
+    )
+    db.commit()
+    return True, f"✅ `{key}` update ho gaya: **{_format_setting_value(key, value)}**"
+
+
+_load_persisted_settings()
+
+# Admin `/settings` me ek setting edit karne ke liye tap kare -> agla plain
+# text message uska naya value maana jaata hai (DM me). key = admin user_id.
+_pending_setting_edit: dict = {}
+
+
+def _settings_overview_text() -> str:
+    lines = ["⚙️ **Bot Settings**", "Neeche kisi setting ko tap karke value badlein.\n"]
+    for key, spec in SETTING_DEFS.items():
+        val = _format_setting_value(key, _setting_display_value(key))
+        lines.append(f"• **{spec['label']}** (`{key}`): {val}")
+    return "\n".join(lines)
+
+
+def _settings_buttons():
+    return [
+        [Button.inline(f"✏️ {spec['label']}", f"cfg:{key}")]
+        for key, spec in SETTING_DEFS.items()
+    ]
+
+
+@bot.on(events.NewMessage(pattern=r"^/settings(@\w+)?"))
+async def on_settings(event):
+    if await _deny_if_not_admin(event):
+        return
+    if not event.is_private:
+        await event.respond("⚙️ Settings sirf DM me admin ke liye available hain — bot ko DM karein.")
+        return
+    await event.respond(_settings_overview_text(), buttons=_settings_buttons(), link_preview=False)
+
+
+@bot.on(events.CallbackQuery(pattern=r"^cfg:(\w+)$"))
+async def on_settings_pick(event):
+    if not is_admin(event):
+        await event.answer("⛔ Ye admin-only hai.", alert=True)
+        return
+    key = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) \
+        else event.pattern_match.group(1)
+    spec = SETTING_DEFS.get(key)
+    if not spec:
+        await event.answer("❌ Unknown setting.", alert=True)
+        return
+    _pending_setting_edit[event.sender_id] = key
+    current = _format_setting_value(key, _setting_display_value(key))
+    await event.answer()
+    await event.respond(
+        f"✏️ **{spec['label']}** (`{key}`)\n"
+        f"Current value: **{current}**\n"
+        f"{spec['hint']}\n\n"
+        f"Naya value reply me bhejein (ya /cancel likhein):"
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/cancel(@\w+)?"))
+async def on_settings_cancel(event):
+    if event.is_private and _pending_setting_edit.pop(event.sender_id, None):
+        await event.respond("Cancelled — koi change nahi hui.")
+
+
+@bot.on(events.NewMessage(pattern=r"^/setconfig(@\w+)?(\s+.*)?$"))
+async def on_setconfig(event):
+    """Power-user shortcut: `/settings` ke tap-and-reply flow ke bina,
+    ek line me directly value set karo. Example: `/setconfig MAX_RESULTS 8`"""
+    if await _deny_if_not_admin(event):
+        return
+    args = (event.pattern_match.group(2) or "").strip().split(maxsplit=1)
+    if len(args) != 2:
+        keys = ", ".join(f"`{k}`" for k in SETTING_DEFS)
+        await event.respond(
+            "Usage: `/setconfig <KEY> <VALUE>`\n\n"
+            f"Available keys: {keys}\n\n"
+            "Ya `/settings` chalayein tap-and-edit ke liye."
+        )
+        return
+    key, value = args[0].upper(), args[1]
+    _, msg = _apply_setting(key, value)
+    await event.respond(msg)
+
+
+async def _resolve_target_id(event, arg: str):
+    """Explicit numeric ID diya ho to wahi use karo, warna reply kiye gaye
+    message ke sender ko target maano. None = na argument, na reply."""
+    if arg:
+        try:
+            return int(arg.split()[0])
+        except ValueError:
+            return None
+    reply = await event.get_reply_message()
+    if reply and reply.sender_id:
+        return reply.sender_id
+    return None
+
+
+@bot.on(events.NewMessage(pattern=r"^/addadmin(@\w+)?(\s+.*)?$"))
+async def on_addadmin(event):
+    if await _deny_if_not_admin(event):
+        return
+    arg = (event.pattern_match.group(2) or "").strip()
+    target_id = await _resolve_target_id(event, arg)
+    if target_id is None:
+        await event.respond(
+            "Usage: `/addadmin <user_id>` ya kisi user ke message ko "
+            "**reply** karke bina argument ke `/addadmin` chalayein.\n"
+            "User ID @userinfobot se pata kar sakte hain."
+        )
+        return
+    if target_id in ADMIN_IDS:
+        await event.respond(f"ℹ️ `{target_id}` pehle se admin hai.")
+        return
+    ADMIN_IDS.add(target_id)
+    _save_admin_ids()
+    await event.respond(f"✅ `{target_id}` ko admin bana diya gaya. Total admins: **{len(ADMIN_IDS)}**")
+
+
+@bot.on(events.NewMessage(pattern=r"^/deladmin(@\w+)?(\s+.*)?$"))
+async def on_deladmin(event):
+    if await _deny_if_not_admin(event):
+        return
+    arg = (event.pattern_match.group(2) or "").strip()
+    target_id = await _resolve_target_id(event, arg)
+    if target_id is None:
+        await event.respond(
+            "Usage: `/deladmin <user_id>` ya kisi admin ke message ko "
+            "**reply** karke bina argument ke `/deladmin` chalayein."
+        )
+        return
+    if target_id not in ADMIN_IDS:
+        await event.respond(f"ℹ️ `{target_id}` admin nahi hai.")
+        return
+    if len(ADMIN_IDS) <= 1:
+        await event.respond(
+            "⛔ Last admin ko remove nahi kar sakte — isse koi bhi admin "
+            "command use nahi kar payega. Pehle koi doosra admin add karein."
+        )
+        return
+    ADMIN_IDS.discard(target_id)
+    _save_admin_ids()
+    note = " (aapne khud ko remove kar diya)" if target_id == event.sender_id else ""
+    await event.respond(
+        f"✅ `{target_id}` ko admin list se hata diya gaya{note}. "
+        f"Total admins: **{len(ADMIN_IDS)}**"
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/admins(@\w+)?"))
+async def on_admins(event):
+    if await _deny_if_not_admin(event):
+        return
+    lines = [f"👑 **Admins** ({len(ADMIN_IDS)})"]
+    lines += [f"• `{uid}`" for uid in sorted(ADMIN_IDS)]
+    lines.append(
+        "\n`/addadmin <id>` · `/deladmin <id>` "
+        "(ya kisi user ke message ko reply karke bina id ke)"
+    )
+    await event.respond("\n".join(lines))
 
 
 def note_title(message, text: str) -> str:
@@ -514,8 +839,8 @@ def _page_buttons(query: str, results, offset: int, owner_id: int):
         if page < npages:
             pager.append(Button.inline("Next ▶", f"pg:{offset + PAGE_SIZE}:{owner_id}"))
         buttons.append(pager)
-    text = (f"🔎 \"{query}\" — {total} results (Page {page}/{npages})\n"
-            f"Tap the note you want:")
+    text = (f"🔎 **\"{query}\"** — {total} results (Page {page}/{npages})\n"
+            f"Required note par tap karein:")
     return text, buttons
 
 
@@ -539,8 +864,10 @@ def _closest_terms(token: str, limit: int = 3, min_ratio: float = 0.72):
     return [t for _, t in scored[:limit]]
 
 
-def search(query: str, limit: int = MAX_RESULTS):
+def search(query: str, limit: int = None):
     """FTS5 se candidates -> fuzzy score se rerank -> top results."""
+    if limit is None:
+        limit = MAX_RESULTS  # runtime value (settings se badal sakta hai)
     toks = tokens(query)
     if not toks:
         return []
@@ -688,26 +1015,27 @@ async def reply_search(chat, query: str, owner_id: int):
         if total == 0:
             await bot.send_message(
                 chat,
-                "❌ Index bilkul khali hai — isliye kuch mil nahi raha.\n\n"
-                "**Setup check karo:**\n"
-                "1. Bot ko notes **channel me ADMIN** banao (tabhi naye posts "
-                "index honge).\n"
+                "❌ **Index Khali Hai**\n"
+                "Abhi tak koi notes indexed nahi hain, isliye result nahi mila.\n\n"
+                "**Setup verify karein:**\n"
+                "1. Bot ko notes **channel me admin** banayein (tabhi naye posts "
+                "index hote hain).\n"
                 "2. Purane posts ke liye `python make_session.py` chala kar "
-                "SESSION_STRING banao, `.env` me daalo, bot restart karo.\n"
-                "3. `.env` me `CHANNEL` sahi likha hai? (jaise `@my_notes_channel`)\n"
-                "4. `/debug` chala kar status dekho.",
+                "SESSION_STRING banayein aur `.env` me add karke bot restart karein.\n"
+                "3. `.env` me `CHANNEL` sahi set hai? (jaise `@my_notes_channel`)\n"
+                "4. Detailed status ke liye `/debug` chalayein.",
                 link_preview=False,
             )
         else:
             await bot.send_message(
                 chat,
-                f"❌ \"{query}\" ke liye kuch nahi mila (index me {total} notes hain).\n\n"
-                "**Try karo:**\n"
-                "• Spelling ek baar check kar lo\n"
-                "• Poora sentence mat likho — sirf 1-2 **keyword** likho "
+                f"❌ **\"{query}\"** ke liye koi result nahi mila (index me {total} notes hain).\n\n"
+                "**Try karein:**\n"
+                "• Spelling ek baar check kar lein\n"
+                "• Poora sentence na likhein — sirf 1-2 **keyword** use karein "
                 "(jaise subject ka naam ya file ka koi khaas shabd)\n"
-                "• Chhota/short word try karo (jaise \"depreciation\" ki jagah \"deprec\")\n\n"
-                f"Tip: `/debug` se index ka status dekh sakte ho.",
+                "• Chhota/short word try karein (jaise \"depreciation\" ki jagah \"deprec\")\n\n"
+                "Tip: `/debug` se index ka status check kar sakte hain.",
                 link_preview=False,
             )
         return
@@ -723,8 +1051,8 @@ async def _deny_if_not_owner(event, owner_id: int) -> bool:
     if event.sender_id == owner_id or is_admin(event):
         return False
     await event.answer(
-        "⛔ Ye sirf usi ke liye hai jisne search ki thi.\n"
-        "Khud dhoondhne ke liye apna `/find <query>` bhejo.",
+        "⛔ Ye buttons sirf search karne wale user ke liye hain.\n"
+        "Khud search karne ke liye apna `/find <query>` bhejein.",
         alert=True,
     )
     return True
@@ -738,7 +1066,7 @@ async def on_page(event):
         return
     if not _check_rate_limit(event.sender_id):
         await event.answer(
-            f"⏳ Thoda slow down, {RATE_LIMIT_WINDOW}s me max "
+            f"⏳ Rate limit reached — {RATE_LIMIT_WINDOW}s me max "
             f"{RATE_LIMIT_COUNT} taps allowed hain.",
             alert=True,
         )
@@ -747,15 +1075,15 @@ async def on_page(event):
     query = _query_from_message_text(msg.text if msg else None)
     if query is None:
         await event.answer(
-            "⚠️ Ye message purana/corrupt hai, /find dobara chalao.",
+            "⚠️ Ye message expired/corrupt hai — `/find` dobara chalayein.",
             alert=True,
         )
         return
     results = search(query, limit=50)
     if not results:
         await event.answer(
-            "Ab is query ke liye kuch nahi mila (notes delete ho gaye honge). "
-            "/find dobara chalao.",
+            "Is query ke liye ab koi result nahi mila (notes delete ho gaye honge). "
+            "`/find` dobara chalayein.",
             alert=True,
         )
         return
@@ -773,7 +1101,7 @@ async def on_note_pick(event):
         return
     if not _check_file_rate_limit(event.sender_id):
         await event.answer(
-            f"⏳ Thoda slow down, {FILE_RATE_LIMIT_WINDOW}s me max "
+            f"⏳ Rate limit reached — {FILE_RATE_LIMIT_WINDOW}s me max "
             f"{FILE_RATE_LIMIT_COUNT} files allowed hain.",
             alert=True,
         )
@@ -782,7 +1110,10 @@ async def on_note_pick(event):
         "SELECT * FROM notes WHERE channel_id=? AND msg_id=?", (cid, mid)
     ).fetchone()
     if not r:
-        await event.answer("Ye note index me nahi mila (purana result hai, dobara search karo)", alert=True)
+        await event.answer(
+            "Ye note ab index me nahi hai (purana result tha) — dobara search karein.",
+            alert=True,
+        )
         return
     await event.answer()
     await _track_user(event, "file")
@@ -828,22 +1159,28 @@ async def on_channel_post(event):
 @bot.on(events.NewMessage(pattern=r"^/(start|help)(@\w+)?"))
 async def on_start(event):
     text = (
-        "👋 **Notes Search Bot**\n\n"
-        "Notes dhoondhne ke liye:\n"
+        "📚 **CA Notes Search Bot**\n"
+        "Channel ke notes turant search karein aur access karein.\n\n"
+        "**Kaise use karein:**\n"
         "• `/find <topic>` — e.g. `/find costing ch 5 marginal costing`\n"
-        "• Inline: `@yourbotname <topic>` (kisi bhi chat me)"
+        "• Inline mode: `@yourbotname <topic>` (kisi bhi chat me)"
     )
     if event.is_private:
-        text += "\n• DM me seedha topic bhi type kar sakte ho, `/find` zaroori nahi"
+        text += "\n• Yahan DM me seedha topic type karein, `/find` likhna zaroori nahi"
     if is_admin(event):
         text += (
-            "\n\n**Admin commands:**\n"
-            "• `/stats` — index me kitne notes hain + user activity\n"
-            "• `/debug` — setup ka poora status (agar search kuch na de)\n"
-            "• `/reindex` — channel ka missing history index karo "
-            "(USER_SESSION chahiye)\n"
+            "\n\n**Admin Commands:**\n"
+            "• `/stats` — usage statistics aur active-user trend\n"
+            "• `/debug` — configuration status (search kaam na kare tab check karein)\n"
+            "• `/settings` — rate limits, page size waghera bot ke through hi "
+            "change karein (bina .env edit kiye)\n"
+            "• `/setconfig <KEY> <VALUE>` — settings ko ek line me set karein\n"
+            "• `/admins`, `/addadmin <id>`, `/deladmin <id>` — admin list manage "
+            "karein (kisi user ko reply karke bina id ke bhi chalta hai)\n"
+            "• `/reindex` — channel ki missing history index karein "
+            "(USER_SESSION zaroori hai)\n"
             "• `/broadcast [--g] [--f] [--p]` — kisi message ko reply karke "
-            "sabko bhejo (details ke liye bina reply ke `/broadcast` chalao)"
+            "sabko bhejein (details ke liye bina reply ke `/broadcast` chalayein)"
         )
     await event.respond(text, link_preview=False)
 
@@ -873,6 +1210,15 @@ async def on_dm_plain_text(event):
     ho jaye — groups me ye kaam nahi karta (wahan spam ho jayega),
     isliye sirf private chat tak limited hai. `not e.out` zaroori hai
     warna bot apne hi bheje results ko naye query samajh ke loop kar dega."""
+    # Agar admin ne `/settings` se koi setting edit karne ke liye tap kiya
+    # tha, to ye agla message uska naya value hai — search mat karo.
+    pending_key = _pending_setting_edit.get(event.sender_id)
+    if pending_key and is_admin(event):
+        del _pending_setting_edit[event.sender_id]
+        ok, msg = _apply_setting(pending_key, event.raw_text.strip())
+        await event.respond(msg)
+        return
+
     if not _check_rate_limit(event.sender_id):
         await _rate_limit_notice(event.respond, event.sender_id)
         return
@@ -880,6 +1226,58 @@ async def on_dm_plain_text(event):
     await _track_user(event, "search")
     async with bot.action(event.chat_id, "typing"):
         await reply_search(event.chat_id, query, event.sender_id)
+
+
+def _last_n_days(n: int = 7):
+    """Aaj samet peeche ke n dino ki 'YYYY-MM-DD' list, oldest pehle."""
+    today = datetime.now().date()
+    return [(today - timedelta(days=i)).isoformat() for i in range(n - 1, -1, -1)]
+
+
+def _day_label(day_str: str) -> str:
+    """'2026-09-09' -> 'Tue 09' (chat me short/readable dikhane ke liye)."""
+    return datetime.strptime(day_str, "%Y-%m-%d").strftime("%a %d")
+
+
+def _bar(value: int, vmax: int, width: int = 10) -> str:
+    """Text-only horizontal bar (Telegram me image nahi bhej sakte,
+    isliye block characters se mini bar-chart banate hain)."""
+    if vmax <= 0:
+        return "░" * width
+    filled = round((value / vmax) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+async def _daily_active_counts(days: list) -> dict:
+    """days: 'YYYY-MM-DD' strings. Returns {day: distinct_active_users}."""
+    if mongo_daily is not None:
+        counts = {}
+        for d in days:
+            counts[d] = await mongo_daily.count_documents({"day": d})
+        return counts
+    placeholders = ",".join("?" * len(days))
+    rows = db.execute(
+        f"SELECT day, COUNT(DISTINCT user_id) c FROM daily_activity "
+        f"WHERE day IN ({placeholders}) GROUP BY day",
+        days,
+    ).fetchall()
+    found = {r["day"]: r["c"] for r in rows}
+    return {d: found.get(d, 0) for d in days}
+
+
+async def _distinct_active_in_range(start_day: str, end_day_exclusive: str) -> int:
+    """start_day tak (inclusive), end_day tak (exclusive) — distinct users."""
+    if mongo_daily is not None:
+        users_set = await mongo_daily.distinct(
+            "user_id", {"day": {"$gte": start_day, "$lt": end_day_exclusive}}
+        )
+        return len(users_set)
+    row = db.execute(
+        "SELECT COUNT(DISTINCT user_id) c FROM daily_activity "
+        "WHERE day>=? AND day<?",
+        (start_day, end_day_exclusive),
+    ).fetchone()
+    return row["c"]
 
 
 @bot.on(events.NewMessage(pattern=r"^/stats(@\w+)?"))
@@ -922,22 +1320,54 @@ async def on_stats(event):
             "ORDER BY (search_count + file_count) DESC LIMIT 5"
         ).fetchall()
 
+    # ---- Daily/Weekly Active Users trend (last 7 din) ----
+    days = _last_n_days(7)
+    daily_counts = await _daily_active_counts(days)
+    vmax = max(daily_counts.values()) if daily_counts else 0
+
+    today = datetime.now().date()
+    this_week_start = (today - timedelta(days=6)).isoformat()
+    next_day = (today + timedelta(days=1)).isoformat()
+    prev_week_start = (today - timedelta(days=13)).isoformat()
+
+    wau_this = await _distinct_active_in_range(this_week_start, next_day)
+    wau_prev = await _distinct_active_in_range(prev_week_start, this_week_start)
+    if wau_prev > 0:
+        change = ((wau_this - wau_prev) / wau_prev) * 100
+        if change > 0:
+            trend = f"↑ {change:.0f}% vs pichla hafta"
+        elif change < 0:
+            trend = f"↓ {abs(change):.0f}% vs pichla hafta"
+        else:
+            trend = "→ same as pichla hafta"
+    else:
+        trend = "↑ naya" if wau_this else "—"
+
     lines = [
         "📊 **Bot Stats**",
-        f"• Notes indexed: **{n}**",
-        f"• Unique users: **{total_users}**",
-        f"• Total searches: **{total_searches}**",
-        f"• Total file downloads: **{total_files}**",
-        f"• User-data backend: {'MongoDB' if mongo_users is not None else 'SQLite'}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📚 Notes indexed: **{n}**",
+        f"👥 Unique users (all-time): **{total_users}**",
+        f"🔍 Total searches: **{total_searches}**",
+        f"📁 Total file downloads: **{total_files}**",
+        f"💾 Backend: {'MongoDB' if mongo_users is not None else 'SQLite'}",
+        "",
+        "📈 **Daily Active Users** (pichle 7 din)",
     ]
+    for d in days:
+        c = daily_counts.get(d, 0)
+        lines.append(f"`{_day_label(d)}` {_bar(c, vmax)} {c}")
+    lines.append(f"\n📅 Weekly active users: **{wau_this}** ({trend})")
 
     if top:
-        lines.append("\n**Top active users:**")
+        lines.append("\n🏆 **Top active users**")
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         for i, u in enumerate(top, 1):
+            rank = medals.get(i, f"{i}.")
             name = f"@{u['username']}" if u["username"] else f"`{u['user_id']}`"
             lines.append(
-                f"{i}. {name} — {u['search_count']} searches, "
-                f"{u['file_count']} files"
+                f"{rank} {name} — 🔍{u['search_count']} searches · "
+                f"📁{u['file_count']} files"
             )
 
     await event.respond("\n".join(lines), link_preview=False)
@@ -971,14 +1401,14 @@ async def on_debug(event):
             if n_ch == 0:
                 lines.append(
                     "⚠️ Channel se abhi tak ek bhi note index nahi hua. "
-                    "Check karo: bot channel me **admin** hai? "
+                    "Verify karein: bot channel me **admin** hai? "
                     "Session string set hai? "
                     "Channel ke posts me caption/text hai?"
                 )
         else:
             lines.append("⚠️ CHANNEL resolve nahi hua — bot channel ka username/ID "
-                         "nahi dekh pa raha. Bot ko channel me add karo ya ID "
-                         "numeric (-100...) form me likho.")
+                         "nahi dekh pa raha. Bot ko channel me add karein ya ID "
+                         "numeric (-100...) form me likhein.")
     await event.respond("\n".join(lines), link_preview=False)
 
 
@@ -992,16 +1422,16 @@ async def on_reindex(event):
     me = await user.get_me() if await user.is_user_authorized() else None
     if me and getattr(me, "bot", False):
         await event.respond(
-            "⚠️ Ye session BOT ki hai — history backfill bot se nahi hota.\n"
-            "`python setup.py` chala kar apne account se user session banao."
+            "⚠️ Ye session ek bot ki hai — history backfill bot account se nahi hota.\n"
+            "`python setup.py` chala kar apne user account se session banayein."
         )
         return
-    await event.respond("🔄 Channel history index ho rahi hai... thoda time lagega.")
+    await event.respond("🔄 Channel history index ho rahi hai — thoda time lagega.")
     count, scanned = await backfill()
     if count is None:
-        await event.respond("❌ CHANNEL resolve nahi hua user session se, .env check karo.")
+        await event.respond("❌ CHANNEL resolve nahi hua user session se — `.env` check karein.")
         return
-    await event.respond(f"✅ Done! {count} notes index ho gaye ({scanned} messages scan hue).")
+    await event.respond(f"✅ **Reindex Complete** — {count} naye notes index hue ({scanned} messages scan hue).")
 
 
 @bot.on(events.NewMessage(pattern=r"^/broadcast(@\w+)?(\s+.*)?$"))
@@ -1023,14 +1453,14 @@ async def on_broadcast(event):
     reply = await event.get_reply_message()
     if not reply:
         await event.respond(
-            "⚠️ Jis message ko broadcast karna hai, usko **reply** karke "
-            "`/broadcast` bhejo.\n\n"
-            "Default: sabhi individual **users** ko DM me bhejega.\n\n"
+            "⚠️ Jo message broadcast karna hai, usko **reply** karke "
+            "`/broadcast` chalayein.\n\n"
+            "Default: sabhi individual **users** ko DM me bheja jaata hai.\n\n"
             "**Flags:**\n"
-            "• `--g` — GROUP ko bhi bhejo (users ke saath, dono)\n"
-            "• `--f` — forward karo (\"Forwarded from\" tag ke saath), "
-            "default me clean copy jaata hai\n"
-            "• `--p` — bhejne ke baad us chat me pin bhi kar do\n\n"
+            "• `--g` — group ko bhi bhejein (users ke saath dono)\n"
+            "• `--f` — forward karein (\"Forwarded from\" tag ke saath); "
+            "default me clean copy jaati hai\n"
+            "• `--p` — bhejne ke baad us chat me pin bhi kar dein\n\n"
             "Example: `/broadcast --g --p`"
         )
         return
@@ -1050,18 +1480,18 @@ async def on_broadcast(event):
             targets.append(int(GROUP_ID))
         else:
             group_warning = (
-                "\n⚠️ `--g` diya tha lekin `.env` me `GROUP_ID` set nahi hai "
+                "\n⚠️ `--g` diya gaya tha, lekin `.env` me `GROUP_ID` set nahi hai "
                 "— isliye sirf users ko bheja gaya."
             )
     if not targets:
         await event.respond(
-            "⚠️ Abhi tak koi user tracked nahi hai (koi bhi user ne "
-            "search/find use nahi kiya, isliye DM list khali hai)."
+            "⚠️ Abhi tak koi user tracked nahi hai — kisi ne bhi search/find "
+            "use nahi kiya, isliye DM list khali hai."
             + group_warning
         )
         return
 
-    status = await event.respond(f"📢 Broadcast shuru... ({len(targets)} recipients){group_warning}")
+    status = await event.respond(f"📢 **Broadcast shuru ho raha hai** — {len(targets)} recipients{group_warning}")
     sent, failed = 0, 0
     for i, chat_id in enumerate(targets, 1):
         for attempt in range(2):  # ek retry FloodWait ke baad
@@ -1087,23 +1517,23 @@ async def on_broadcast(event):
         await asyncio.sleep(0.05)  # thoda gap, Telegram flood limits se bachne ke liye
         if i % 25 == 0:
             try:
-                await status.edit(f"📢 Broadcast chal raha hai... {i}/{len(targets)} "
+                await status.edit(f"📢 Broadcast in progress — {i}/{len(targets)} "
                                    f"({sent} sent, {failed} failed)")
             except Exception:
                 pass
 
     await status.edit(
-        f"✅ Broadcast complete: **{sent}** bheja gaya, **{failed}** fail hua "
-        f"(total {len(targets)} recipients)."
+        f"✅ **Broadcast Complete**\n"
+        f"Sent: **{sent}** · Failed: **{failed}** · Total recipients: {len(targets)}"
         + group_warning
     )
 
 
 def no_session_msg():
     return (
-        "⚠️ Purana history index karne ke liye USER_SESSION chahiye.\n"
-        "README dekho: `python make_session.py` chala kar session banao "
-        "aur .env me SESSION_STRING daalo, phir bot restart karo."
+        "⚠️ Purani history index karne ke liye USER_SESSION zaroori hai.\n"
+        "README dekhein: `python make_session.py` chala kar session banayein, "
+        "`.env` me SESSION_STRING add karein, phir bot restart karein."
     )
 
 
@@ -1176,7 +1606,7 @@ async def inline_handler(event):
         await event.answer(results)
     else:
         await event.answer(
-            [builder.article("Kuch nahi mila", text="Doosre keywords try karo!")],
+            [builder.article("Koi result nahi mila", text="Doosre keywords try karein.")],
             cache_time=1,
         )
 
