@@ -803,12 +803,26 @@ class Result:
 # live search dobara chala dete hain. Isse bot restart, redeploy, ya
 # doosra process chalne se bhi buttons kabhi "stale" nahi hote.
 
-_QUERY_RE = re.compile(r'^🔎 "(.*)" — \d+ results \(Page \d+/\d+\)')
+_QUERY_RE = re.compile(
+    r'🔎\s*(?:\*\*)?["“](.+?)["”](?:\*\*)?\s*[—–-]\s*'
+    r'\d+\s+results\s*\(Page\s+\d+\s*/\s*\d+\)',
+    re.IGNORECASE,
+)
 
 
 def _query_from_message_text(text: str):
-    m = _QUERY_RE.match(text or "")
-    return m.group(1) if m else None
+    if not text:
+        return None
+
+    text = text.strip()
+    m = _QUERY_RE.search(text)
+    if m:
+        return m.group(1).strip()
+
+    # Fallback: heading ki first line me quotes ke andar query nikaalo.
+    first_line = text.splitlines()[0]
+    m = re.search(r'["“](.+?)["”]', first_line)
+    return m.group(1).strip() if m else None
 
 
 def display_title(r) -> str:
@@ -1072,7 +1086,14 @@ async def on_page(event):
         )
         return
     msg = await event.get_message()
-    query = _query_from_message_text(msg.text if msg else None)
+    message_text = None
+    if msg:
+        message_text = (
+            getattr(msg, "raw_text", None)
+            or getattr(msg, "text", None)
+            or getattr(msg, "message", None)
+        )
+    query = _query_from_message_text(message_text)
     if query is None:
         await event.answer(
             "⚠️ Ye message expired/corrupt hai — `/find` dobara chalayein.",
