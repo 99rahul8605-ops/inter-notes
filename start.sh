@@ -11,12 +11,12 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 cd "$(dirname "$SCRIPT_PATH")"
 
-SESSION_NAME="internotesbot"
+SESSION_NAME="notesbot"
 
 # ---------- 0) Background me (screen session) relaunch karo ----------
-# internotesbot_FOREGROUND already set matlab hum khud screen session ke andar
+# NOTESBOT_FOREGROUND already set matlab hum khud screen session ke andar
 # hain — ab seedha aage badho (setup + run loop).
-if [ -z "${internotesbot_FOREGROUND:-}" ]; then
+if [ -z "${NOTESBOT_FOREGROUND:-}" ]; then
     if command -v screen >/dev/null 2>&1; then
         if screen -list 2>/dev/null | grep -q "\.${SESSION_NAME}[[:space:]]"; then
             echo "🔁 Purana '$SESSION_NAME' session mila — usko band karke fresh restart kar raha hoon..."
@@ -28,9 +28,9 @@ if [ -z "${internotesbot_FOREGROUND:-}" ]; then
             done
         fi
         echo "🖥️  '$SESSION_NAME' screen session me bot background me start kar raha hoon..."
-        LOG_FILE="$(dirname "$SCRIPT_PATH")/internotesbot_screen.log"
+        LOG_FILE="$(dirname "$SCRIPT_PATH")/notesbot_screen.log"
         rm -f "$LOG_FILE"
-        internotesbot_FOREGROUND=1 screen -L -Logfile "$LOG_FILE" -dmS "$SESSION_NAME" bash "$SCRIPT_PATH"
+        NOTESBOT_FOREGROUND=1 screen -L -Logfile "$LOG_FILE" -dmS "$SESSION_NAME" bash "$SCRIPT_PATH"
 
         # Verify karo ki session actually zinda rahi (turant crash to nahi hui)
         ALIVE=0
