@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 cd "$(dirname "$SCRIPT_PATH")"
 
-SESSION_NAME="notesbot"
+SESSION_NAME="internotes"
 
 # ---------- 0) Background me (screen session) relaunch karo ----------
 # NOTESBOT_FOREGROUND already set matlab hum khud screen session ke andar
