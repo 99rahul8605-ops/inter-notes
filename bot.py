@@ -1155,10 +1155,14 @@ async def on_album(event):
 async def channel_id():
     if not CHANNEL:
         return None
+    # A -100... marked peer ID already identifies the channel; no API
+    # entity/access_hash lookup is needed just to compare event.chat_id.
+    if CHANNEL.lstrip("-").isdigit():
+        return int(CHANNEL)
     if CHANNEL not in _chan_cache:
         try:
             ent = await bot.get_entity(CHANNEL)
-        except ValueError:
+        except (ValueError, TypeError):
             if user:
                 ent = await user.get_entity(CHANNEL)
             else:
@@ -1170,7 +1174,14 @@ async def channel_id():
 _chan_cache = {}
 
 
-@bot.on(events.NewMessage(chats=CHANNEL if CHANNEL else None))
+# Convert numeric -100... IDs to int. Passing strings makes Telethon try to
+# resolve them as phone numbers, which bots cannot do.
+CHANNEL_EVENT_FILTER = (
+    int(CHANNEL) if CHANNEL and CHANNEL.lstrip("-").isdigit()
+    else (CHANNEL or None)
+)
+
+@bot.on(events.NewMessage(chats=CHANNEL_EVENT_FILTER))
 async def on_channel_post(event):
     """Bot channel me admin hai -> har naya post auto-index."""
     if event.is_channel:
@@ -1558,12 +1569,49 @@ def no_session_msg():
     )
 
 
+async def resolve_user_channel():
+    """User session se channel resolve karo, including uncached private IDs.
+
+    StringSession entity/access-hash cache persist nahi karti. Isliye direct
+    numeric get_entity() fail ho sakta hai, even when user channel ka member ho.
+    Dialogs fetch karne se correct InputPeer/access_hash available ho jata hai.
+    """
+    target = CHANNEL.strip()
+    if not target:
+        print("❌ CHANNEL .env mein empty hai.")
+        return None
+
+    lookup = int(target) if target.lstrip("-").isdigit() else target
+    try:
+        return await user.get_entity(lookup)
+    except Exception as exc:
+        print(f"⚠️ Direct channel lookup failed: {type(exc).__name__}: {exc}")
+
+    print("🔄 User account ke Telegram dialogs se channel dhoondh raha hoon...")
+    try:
+        async for dialog in user.iter_dialogs():
+            if isinstance(lookup, int):
+                matched = dialog.id == lookup
+            else:
+                username = getattr(dialog.entity, "username", None)
+                matched = bool(username and username.lower() == target.lstrip("@").lower())
+            if matched:
+                print(f"✅ Channel resolved: {dialog.name} ({dialog.id})")
+                return dialog.entity
+    except Exception as exc:
+        print(f"❌ Dialog scan failed: {type(exc).__name__}: {exc}")
+        return None
+
+    print("❌ Channel user account ke dialogs mein nahi mila. "
+          "Check karo ki SESSION_STRING wala user channel ka member hai.")
+    return None
+
+
 async def backfill():
     """Channel ka history index karo — poora nahi, sirf last indexed
     message ke BAAD wale (incremental), taaki repeat runs fast ho."""
-    try:
-        entity = await user.get_entity(CHANNEL)
-    except Exception:
+    entity = await resolve_user_channel()
+    if entity is None:
         return None, 0
     cid = utils.get_peer_id(entity)  # marked id (-100...), bot events jaise hi
     row = db.execute(
